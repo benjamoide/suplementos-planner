@@ -1,8 +1,9 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
 
-// https://vite.dev/config/
-export default defineConfig({
+const REPO_NAME = "suplementos-planner"; // <-- TU repo exacto
+
+export default defineConfig(({ command }) => ({
   plugins: [react()],
-  base: '/suplementos-planner/',
-})
+  base: command === "build" ? `/${REPO_NAME}/` : "/",
+}));
