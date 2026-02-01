@@ -1,194 +1,22 @@
 import React, { useEffect, useMemo, useState } from "react";
 import "./App.css";
+import * as U from "./util.js";
+import { suggestCycleByName } from "./cycleCatalog.js";
 
-// =====================
-// Storage keys
-// =====================
-const STORAGE_TAKEN = "suppPlanner:taken:v3";
+// ---- Storage keys (bump version if you change shapes) ----
+const STORAGE_ROUTINES = "suppPlanner:routines:v2";
+const STORAGE_NOT_TAKEN = "suppPlanner:notTaken:v2";
+const STORAGE_CYCLES = "suppPlanner:cycles:v3";
+const STORAGE_USER_ROUTINE = "suppPlanner:userRoutine:v2";
+const STORAGE_MEALS_BY_DATE = "suppPlanner:mealsByDate:v2";
 const STORAGE_PRICES = "suppPlanner:prices:v1";
 
-// =====================
-// Robust JSON parse (FIX: handles null/"null"/non-objects)
-// =====================
-function safeJsonObject(s, fallback = {}) {
-  if (s === null || s === undefined || s === "") return fallback;
-  try {
-    const v = JSON.parse(s);
-    if (v && typeof v === "object" && !Array.isArray(v)) return v;
-    return fallback; // handles null, numbers, strings, arrays
-  } catch {
-    return fallback;
-  }
+function Pill({ children, tone = "neutral" }) {
+  return <span className={`pill pill-${tone}`}>{children}</span>;
 }
 
-// =====================
-// Date utils
-// =====================
-function toISODate(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-function parseISODate(s) {
-  if (!s) return null;
-  if (s instanceof Date && !Number.isNaN(s.getTime())) return s;
-  const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return null;
-  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-}
-
-function addDays(d, n) {
-  const x = new Date(d);
-  x.setDate(x.getDate() + n);
-  return x;
-}
-
-function startOfWeekMonday(d) {
-  const wd = d.getDay(); // Sun=0
-  const delta = wd === 0 ? -6 : 1 - wd;
-  const x = new Date(d);
-  x.setDate(x.getDate() + delta);
-  x.setHours(0, 0, 0, 0);
-  return x;
-}
-
-function startOfMonth(d) {
-  return new Date(d.getFullYear(), d.getMonth(), 1);
-}
-
-function endOfMonth(d) {
-  return new Date(d.getFullYear(), d.getMonth() + 1, 0);
-}
-
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-// =====================
-// Canonical key (fix UC-II mismatch etc.)
-// =====================
-function canonKey(s) {
-  return String(s || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[®™©]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim()
-    .replace(/\s+/g, " ");
-}
-
-// =====================
-// Weekday detection in text (fix Copper etc.)
-// =====================
-function isoWeekday(d) {
-  const js = d.getDay(); // 0=Dom..6=Sáb
-  return js === 0 ? 7 : js; // 1=Lun..7=Dom
-}
-
-function normText(s) {
-  return String(s || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
-}
-
-function extractWeekdaysFromText(...parts) {
-  const t = normText(parts.filter(Boolean).join(" "));
-  const map = [
-    { keys: ["lun", "lunes"], val: 1 },
-    { keys: ["mar", "martes"], val: 2 },
-    { keys: ["mie", "miercoles", "miércoles"], val: 3 },
-    { keys: ["jue", "jueves"], val: 4 },
-    { keys: ["vie", "viernes"], val: 5 },
-    { keys: ["sab", "sabado", "sábado", "sabados", "sábados"], val: 6 },
-    { keys: ["dom", "domingo"], val: 7 },
-  ];
-
-  const set = new Set();
-  for (const { keys, val } of map) {
-    for (const k of keys) {
-      const re = new RegExp(`\\b${k}\\b`, "i");
-      if (re.test(t)) set.add(val);
-    }
-  }
-
-  // Compact patterns like "mar/jue/sab"
-  if (t.includes("/")) {
-    const chunks = t.split(/[^a-z]+/).filter(Boolean);
-    const chunkSet = new Set(chunks);
-    for (const { keys, val } of map) {
-      for (const k of keys) {
-        if (chunkSet.has(k)) set.add(val);
-      }
-    }
-  }
-
-  return set.size ? set : null;
-}
-
-// =====================
-// Dose parsing for cost estimation
-// =====================
-function parseNumberLoose(text) {
-  const t = normText(text).replace(",", ".");
-  if (t.includes("½")) return 0.5;
-
-  const frac = t.match(/(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)/);
-  if (frac) {
-    const a = Number(frac[1]);
-    const b = Number(frac[2]);
-    if (Number.isFinite(a) && Number.isFinite(b) && b !== 0) return a / b;
-  }
-
-  const range = t.match(/(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)/);
-  if (range) {
-    const a = Number(range[1]);
-    const b = Number(range[2]);
-    if (Number.isFinite(a) && Number.isFinite(b)) return (a + b) / 2;
-  }
-
-  const m = t.match(/(\d+(?:\.\d+)?)/);
-  if (!m) return null;
-  const v = Number(m[1]);
-  return Number.isFinite(v) ? v : null;
-}
-
-function parseDoseUnits(doseText, preferredUnit /* "caps"|"g"|"" */) {
-  const t = normText(doseText);
-
-  const hasCaps = /caps|capsula|c[aá]psula|tablet|tab|softgel/.test(t);
-  const hasGrams = (/\bgr\b|\bgrs\b|\bg\b|\bgramo/.test(t) && !/\bmg\b/.test(t));
-  const hasMg = /\bmg\b/.test(t);
-
-  const num = parseNumberLoose(t);
-
-  if (preferredUnit === "caps") {
-    if (num !== null) return { value: num, unit: "caps" };
-    if (hasCaps) return { value: 1, unit: "caps" };
-    return null;
-  }
-  if (preferredUnit === "g") {
-    if (hasGrams && num !== null) return { value: num, unit: "g" };
-    if (hasMg && num !== null) return { value: num / 1000, unit: "g" };
-    if (num !== null && !hasCaps) return { value: num, unit: "g" };
-    return null;
-  }
-
-  if (hasCaps) return { value: num !== null ? num : 1, unit: "caps" };
-  if (hasGrams) return { value: num !== null ? num : null, unit: "g" };
-  if (hasMg) return { value: num !== null ? num / 1000 : null, unit: "g" };
-
-  return null;
-}
-
-// =====================
-// UI helpers
-// =====================
 function Progress({ ratio }) {
-  const pct = clamp(Math.round((ratio || 0) * 100), 0, 100);
+  const pct = U.clamp(Math.round((ratio || 0) * 100), 0, 100);
   return (
     <div className="progress">
       <div className="progressFill" style={{ width: `${pct}%` }} />
@@ -197,23 +25,6 @@ function Progress({ ratio }) {
   );
 }
 
-function Pill({ children, tone = "neutral" }) {
-  return <span className={`pill pill-${tone}`}>{children}</span>;
-}
-
-function money(v) {
-  if (!Number.isFinite(v)) return "—";
-  return new Intl.NumberFormat(undefined, { style: "currency", currency: "EUR" }).format(v);
-}
-
-function number(v, digits = 2) {
-  if (!Number.isFinite(v)) return "—";
-  return new Intl.NumberFormat(undefined, { maximumFractionDigits: digits, minimumFractionDigits: digits }).format(v);
-}
-
-// =====================
-// Error boundary (no more "blank screen")
-// =====================
 class ErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
@@ -223,16 +34,13 @@ class ErrorBoundary extends React.Component {
     return { err: error };
   }
   componentDidCatch(error, info) {
-    // You can also log to console
-    // eslint-disable-next-line no-console
     console.error("App crashed:", error, info);
   }
   render() {
     if (this.state.err) {
       return (
         <div className="card cardError" style={{ marginTop: 12 }}>
-          <div className="cardTitle">La app ha fallado (ErrorBoundary)</div>
-          <div className="muted">Copia el error de consola si necesitas ayuda adicional.</div>
+          <div className="cardTitle">La app ha fallado</div>
           <pre className="pre">{String(this.state.err?.message || this.state.err)}</pre>
         </div>
       );
@@ -241,9 +49,6 @@ class ErrorBoundary extends React.Component {
   }
 }
 
-// =====================
-// Main export wrapper
-// =====================
 export default function App() {
   return (
     <ErrorBoundary>
@@ -252,142 +57,536 @@ export default function App() {
   );
 }
 
-// =====================
-// App logic (inner)
-// =====================
-function AppInner() {
-  const [fileName, setFileName] = useState("");
-  const [params, setParams] = useState([]);
-  const [routine, setRoutine] = useState([]);
-  const [selectedDate, setSelectedDate] = useState(() => toISODate(new Date()));
-  const [monthCursor, setMonthCursor] = useState(() => startOfMonth(new Date()));
-  const [yearCursor, setYearCursor] = useState(() => new Date().getFullYear());
-  const [view, setView] = useState("day");
-  const [showOff, setShowOff] = useState(false);
-  const [errorMsg, setErrorMsg] = useState("");
+// ---------------- Excel parsing ----------------
 
-  // FIX: safeJsonObject avoids null state that crashes rendering
-  const [taken, setTaken] = useState(() => safeJsonObject(localStorage.getItem(STORAGE_TAKEN), {}));
-  useEffect(() => localStorage.setItem(STORAGE_TAKEN, JSON.stringify(taken || {})), [taken]);
+function isProbablyHeaderRow(row) {
+  const joined = (row || []).map((x) => String(x || "").toLowerCase()).join(" | ");
+  return (
+    joined.includes("momento") ||
+    joined.includes("suplement") ||
+    joined.includes("supplement") ||
+    joined.includes("dosis") ||
+    joined.includes("dose")
+  );
+}
 
-  const [prices, setPrices] = useState(() => safeJsonObject(localStorage.getItem(STORAGE_PRICES), {}));
-  useEffect(() => localStorage.setItem(STORAGE_PRICES, JSON.stringify(prices || {})), [prices]);
+function cleanStr(x) {
+  return String(x ?? "").trim();
+}
 
-  const paramByCanon = useMemo(() => {
-    const m = new Map();
-    for (const p of params) m.set(p.canon, p);
-    return m;
-  }, [params]);
+function normalizeHeader(h) {
+  return cleanStr(h)
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ");
+}
 
-  const allSupp = useMemo(() => {
-    const map = new Map();
-    for (const r of routine) map.set(r.canon, r.suplemento);
-    for (const p of params) if (!map.has(p.canon)) map.set(p.canon, p.name);
-    return Array.from(map.entries())
-      .map(([canon, name]) => ({ canon, name }))
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }, [routine, params]);
+// Supports:
+// Headered: Momento del día | Supplement | Dose
+// Headerless: A=Momento, B=Supplement, C=Dose
+function parseRoutineSheet(wb, sheetName, XLSX, srcTag) {
+  const ws = wb.Sheets[sheetName];
+  if (!ws) return [];
 
-  function computeStatusForDate(dateObj, p) {
-    if (!p?.startDate || !Number.isFinite(p.onDays) || !Number.isFinite(p.offDays)) return "ON";
-    const dayIndex = Math.floor((dateObj.getTime() - p.startDate.getTime()) / 86400000);
-    if (dayIndex < 0) return "OFF";
-    if (dayIndex < (p.pauseDays || 0)) return "OFF";
-    const effective = dayIndex - (p.pauseDays || 0);
-    const period = p.onDays + p.offDays;
-    if (period <= 0) return "ON";
-    const pos = ((effective % period) + period) % period;
-    return pos < p.onDays ? "ON" : "OFF";
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+  const data = rows.filter((r) => (r || []).some((c) => cleanStr(c) !== ""));
+  if (!data.length) return [];
+
+  const hasHeader = isProbablyHeaderRow(data[0]);
+
+  let out = [];
+  if (hasHeader) {
+    const header = data[0].map(normalizeHeader);
+
+    const idxMom = header.findIndex((h) => h.includes("momento"));
+    const idxSup =
+      header.findIndex((h) => h.includes("supplement")) >= 0
+        ? header.findIndex((h) => h.includes("supplement"))
+        : header.findIndex((h) => h.includes("suplemento") || h.includes("suplement"));
+    const idxDose = header.findIndex((h) => h.includes("dosis") || h.includes("dose"));
+    const idxRule = header.findIndex((h) => h.includes("regla") || h.includes("rule"));
+    const idxNotes = header.findIndex((h) => h.includes("nota") || h.includes("notes"));
+
+    let currentMom = "";
+    for (let i = 1; i < data.length; i++) {
+      const r = data[i] || [];
+      const mom = idxMom >= 0 ? cleanStr(r[idxMom]) : "";
+      if (mom) currentMom = mom;
+
+      const suplemento = idxSup >= 0 ? cleanStr(r[idxSup]) : "";
+      if (!suplemento) continue;
+
+      const dosis = idxDose >= 0 ? cleanStr(r[idxDose]) : "";
+      const regla = idxRule >= 0 ? cleanStr(r[idxRule]) : "";
+      const notas = idxNotes >= 0 ? cleanStr(r[idxNotes]) : "";
+
+      out.push({
+        momento: currentMom || "Sin momento",
+        suplemento,
+        dosis,
+        regla,
+        notas,
+        canon: U.canonKey(suplemento),
+        _src: srcTag,
+        _ord: U.momentRank(currentMom) * 1000 + i,
+      });
+    }
+  } else {
+    // Headerless: A Momento, B Supplement, C Dose
+    let currentMom = "";
+    for (let i = 0; i < data.length; i++) {
+      const r = data[i] || [];
+      const colA = cleanStr(r[0]);
+      const colB = cleanStr(r[1]);
+      const colC = cleanStr(r[2]);
+
+      if (colA) currentMom = colA;
+      if (!colB) continue;
+
+      out.push({
+        momento: currentMom || "Sin momento",
+        suplemento: colB,
+        dosis: colC || "",
+        regla: "",
+        notas: "",
+        canon: U.canonKey(colB),
+        _src: srcTag,
+        _ord: U.momentRank(currentMom) * 1000 + i,
+      });
+    }
   }
 
-  // Fix #1 weekday + Fix #2 canonical matching + showOff for OFF items
-  function isPlannedForDate(dateObj, routineItem) {
-    const wdSet = extractWeekdaysFromText(routineItem.dosis, routineItem.regla, routineItem.notas);
-    if (wdSet && !wdSet.has(isoWeekday(dateObj))) return false;
+  // Generate stable-ish keys per momento+canon (dedupe with suffix)
+  const seen = new Map();
+  out = out.map((it) => {
+    const base = `${it.momento}||${it.canon}`;
+    const n = (seen.get(base) || 0) + 1;
+    seen.set(base, n);
+    const key = n === 1 ? base : `${base}||#${n}`;
+    return { ...it, key };
+  });
 
-    const p = paramByCanon.get(routineItem.canon);
-    if (!p) return true;
+  return out;
+}
 
-    const st = computeStatusForDate(dateObj, p);
-    return st === "ON" ? true : showOff;
+// ---------------- App logic ----------------
+
+function AppInner() {
+  const todayISO = U.toISODate(new Date());
+  const tomorrowISO = U.toISODate(U.addDays(new Date(), 1));
+
+  // Persisted routines (so you don't re-upload)
+  const [fileName, setFileName] = useState("");
+  const [routine2, setRoutine2] = useState([]);
+  const [routine3, setRoutine3] = useState([]);
+  const [errorMsg, setErrorMsg] = useState("");
+
+  // User-added items
+  const [userRoutine, setUserRoutine] = useState(() =>
+    U.safeJsonObject(localStorage.getItem(STORAGE_USER_ROUTINE), { items: [] })
+  );
+
+  // Cycles config per canon
+  const [cycles, setCycles] = useState(() =>
+    U.safeJsonObject(localStorage.getItem(STORAGE_CYCLES), {})
+  );
+
+  // Prices config per canon
+  const [prices, setPrices] = useState(() =>
+    U.safeJsonObject(localStorage.getItem(STORAGE_PRICES), {})
+  );
+
+  // Per-day choice: 2 or 3 meals
+  const [mealsByDate, setMealsByDate] = useState(() =>
+    U.safeJsonObject(localStorage.getItem(STORAGE_MEALS_BY_DATE), {})
+  );
+
+  // Default = taken; store only NOT taken
+  const [notTaken, setNotTaken] = useState(() =>
+    U.safeJsonObject(localStorage.getItem(STORAGE_NOT_TAKEN), {})
+  );
+
+  // UI state
+  const [selectedDate, setSelectedDate] = useState(() => todayISO);
+  const [monthCursor, setMonthCursor] = useState(() => U.startOfMonth(new Date()));
+  const [yearCursor, setYearCursor] = useState(() => new Date().getFullYear());
+  const [view, setView] = useState("day"); // day|week|month|cycles|add|costs
+  const [showOff, setShowOff] = useState(false);
+
+  // ---- Load persisted routines ----
+  useEffect(() => {
+    const saved = U.safeJsonObject(localStorage.getItem(STORAGE_ROUTINES), null);
+    if (saved && typeof saved === "object") {
+      if (Array.isArray(saved.routine2)) setRoutine2(saved.routine2);
+      if (Array.isArray(saved.routine3)) setRoutine3(saved.routine3);
+      if (saved.fileName) setFileName(saved.fileName);
+    }
+  }, []);
+
+  // ---- Persist state ----
+  useEffect(() => {
+    localStorage.setItem(STORAGE_USER_ROUTINE, JSON.stringify(userRoutine || { items: [] }));
+  }, [userRoutine]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_CYCLES, JSON.stringify(cycles || {}));
+  }, [cycles]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_PRICES, JSON.stringify(prices || {}));
+  }, [prices]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_MEALS_BY_DATE, JSON.stringify(mealsByDate || {}));
+  }, [mealsByDate]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_NOT_TAKEN, JSON.stringify(notTaken || {}));
+  }, [notTaken]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      STORAGE_ROUTINES,
+      JSON.stringify({ fileName, routine2, routine3, savedAt: new Date().toISOString() })
+    );
+  }, [fileName, routine2, routine3]);
+
+  function mealsForISO(iso) {
+    const v = mealsByDate?.[iso];
+    return v === 2 || v === 3 ? v : 3;
+  }
+  function setMealsForISO(iso, v) {
+    setMealsByDate((prev) => {
+      const p = prev && typeof prev === "object" ? prev : {};
+      return { ...p, [iso]: v };
+    });
+  }
+
+  const dayObj = useMemo(() => U.parseISODate(selectedDate) || new Date(), [selectedDate]);
+
+  function cfgForCanon(canon) {
+    const c = cycles?.[canon];
+    return c && typeof c === "object" ? c : { mode: "none" };
+  }
+
+  function ensureDefaultsForCanon(canon, name) {
+    setCycles((prev) => {
+      const p = prev && typeof prev === "object" ? { ...prev } : {};
+      if (p[canon]) return prev;
+
+      const t = suggestCycleByName(name);
+      if (t) {
+        p[canon] = {
+          name,
+          mode: t.mode || "none",
+          startISO: tomorrowISO,
+          onDays: t.onDays ?? 90,
+          offDays: t.offDays ?? 30,
+          pauseDays: t.pauseDays ?? 0,
+          // anchor for "cada N días"
+          intervalAnchorISO: tomorrowISO,
+        };
+      } else {
+        p[canon] = { name, mode: "none", startISO: tomorrowISO, onDays: 90, offDays: 30, pauseDays: 0, intervalAnchorISO: tomorrowISO };
+      }
+      return p;
+    });
+  }
+
+  // Merge routine for given date: base (2c/3c) + user additions
+  const routineForISO = useMemo(() => {
+    const cache = new Map();
+    return (iso) => {
+      if (cache.has(iso)) return cache.get(iso);
+
+      const base = mealsForISO(iso) === 2 ? routine2 : routine3;
+
+      const extra = (userRoutine?.items || []).map((x, idx) => {
+        const canon = U.canonKey(x.suplemento);
+        return {
+          momento: x.momento || "Sin momento",
+          suplemento: x.suplemento,
+          dosis: x.dosis || "",
+          regla: x.regla || "",
+          notas: x.notas || "",
+          canon,
+          key: x.key || `${x.momento || "Sin momento"}||${canon}||user||#${idx}`,
+          _src: "user",
+          _ord: U.momentRank(x.momento) * 1000 + 900 + idx,
+        };
+      });
+
+      const merged = [...base, ...extra].sort((a, b) => (a._ord - b._ord) || a.suplemento.localeCompare(b.suplemento));
+      cache.set(iso, merged);
+      return merged;
+    };
+  }, [routine2, routine3, userRoutine, mealsByDate]);
+
+  // All supplements list (for cycles/prices)
+  const allSupp = useMemo(() => {
+    const map = new Map();
+    const addFrom = (arr) => {
+      for (const it of arr) map.set(it.canon, it.suplemento);
+    };
+    addFrom(routine2);
+    addFrom(routine3);
+    for (const it of (userRoutine?.items || [])) {
+      map.set(U.canonKey(it.suplemento), it.suplemento);
+    }
+    return Array.from(map.entries()).map(([canon, name]) => ({ canon, name })).sort((a, b) => a.name.localeCompare(b.name));
+  }, [routine2, routine3, userRoutine]);
+
+  // Ensure cycles defaults exist for known supplements (once routines appear)
+  useEffect(() => {
+    for (const s of allSupp) ensureDefaultsForCanon(s.canon, s.name);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allSupp.length]);
+
+  // ---------- “Taken” logic (default taken; only store notTaken) ----------
+  function getNotTakenMap(iso) {
+    const base = notTaken && typeof notTaken === "object" ? notTaken : {};
+    return base[iso] || {};
+  }
+
+  function setNotTakenFor(iso, itemKey, value) {
+    setNotTaken((prev) => {
+      const p = prev && typeof prev === "object" ? prev : {};
+      const day = { ...(p[iso] || {}) };
+      if (value) day[itemKey] = true;
+      else delete day[itemKey];
+      return { ...p, [iso]: day };
+    });
+  }
+
+  function assumeAllTaken(iso) {
+    setNotTaken((prev) => {
+      const p = prev && typeof prev === "object" ? prev : {};
+      return { ...p, [iso]: {} };
+    });
+  }
+
+  function markAllNotTaken(iso) {
+    const planned = plannedItemsForISO(iso).filter((x) => x.status === "ON");
+    setNotTaken((prev) => {
+      const p = prev && typeof prev === "object" ? prev : {};
+      const day = { ...(p[iso] || {}) };
+      for (const it of planned) day[it.key] = true;
+      return { ...p, [iso]: day };
+    });
+  }
+
+  function isActuallyTaken(canon, iso, dateObj) {
+    // if not planned that day, ignore
+    if (!scheduledOnDate(canon, dateObj)) return false;
+    // default taken unless marked NOT taken
+    const day = getNotTakenMap(iso);
+    // consider taken if no key for that canon is marked
+    for (const [k, v] of Object.entries(day)) {
+      if (v === true && String(k).includes(`||${canon}`)) return false;
+    }
+    return true;
+  }
+
+  // ---------- Schedule rules ----------
+  function scheduledOnDate(canon, dateObj) {
+    const iso = U.toISODate(dateObj);
+    const routine = routineForISO(iso);
+    const items = routine.filter((x) => x.canon === canon);
+    if (!items.length) return false;
+
+    const wd = U.isoWeekday(dateObj);
+    for (const it of items) {
+      const wds = U.extractWeekdaysFromText(it.dosis, it.regla, it.notas);
+      if (wds && !wds.has(wd)) continue;
+
+      // interval-days like "cada 2 días"
+      const interval = U.extractIntervalDaysFromText(it.dosis, it.regla, it.notas);
+      if (interval && interval > 1) {
+        const cfg = cfgForCanon(canon);
+        const anchorISO = cfg.intervalAnchorISO || cfg.startISO || tomorrowISO;
+        const anchor = U.parseISODate(anchorISO);
+        if (!anchor) continue;
+        const diff = Math.floor((dateObj.getTime() - anchor.getTime()) / U.MS_DAY);
+        if (diff < 0) continue;
+        if (diff % interval !== 0) continue;
+      }
+
+      return true;
+    }
+    return false;
+  }
+
+  // ---------- Cycle status ----------
+  function statusCalendar(canon, dateObj) {
+    const cfg = cfgForCanon(canon);
+    if (!cfg || cfg.mode === "none") return "ON";
+    const start = U.parseISODate(cfg.startISO);
+    if (!start) return "ON";
+
+    const dayIndex = Math.floor((dateObj.getTime() - start.getTime()) / U.MS_DAY);
+    if (dayIndex < 0) return "OFF";
+
+    // initial pauseDays are OFF
+    const pauseDays = Number(cfg.pauseDays || 0);
+    if (dayIndex < pauseDays) return "OFF";
+
+    const effective = dayIndex - pauseDays;
+    const onDays = Number(cfg.onDays || 0);
+    const offDays = Number(cfg.offDays || 0);
+    const period = onDays + offDays;
+    if (period <= 0 || onDays <= 0) return "ON";
+
+    const pos = ((effective % period) + period) % period;
+    return pos < onDays ? "ON" : "OFF";
+  }
+
+  // Precompute taken-mode calendar for the selected year (fast enough)
+  const takenModeMapForYear = useMemo(() => {
+    const yearStart = new Date(yearCursor, 0, 1);
+    const yearEnd = new Date(yearCursor, 11, 31);
+    const result = new Map();
+
+    for (const s of allSupp) {
+      const cfg = cfgForCanon(s.canon);
+      if (cfg.mode !== "taken") continue;
+
+      const start = U.parseISODate(cfg.startISO);
+      if (!start) continue;
+
+      const mapISO = new Map();
+
+      let phase = "OFF";
+      let offRem = Number(cfg.pauseDays || 0);
+      let onCount = 0;
+      if (offRem <= 0) phase = "ON";
+
+      for (let d = new Date(start); d <= yearEnd; d = U.addDays(d, 1)) {
+        const iso = U.toISODate(d);
+
+        const statusNow = phase === "ON" ? "ON" : "OFF";
+        if (d >= yearStart && d <= yearEnd) mapISO.set(iso, statusNow);
+
+        let takenFlag = false;
+        if (phase === "ON") {
+          // for past days use actual; for future assume taken if scheduled
+          if (iso <= todayISO) takenFlag = isActuallyTaken(s.canon, iso, d);
+          else takenFlag = scheduledOnDate(s.canon, d);
+        }
+
+        if (phase === "OFF") {
+          offRem -= 1;
+          if (offRem <= 0) {
+            phase = "ON";
+            onCount = 0;
+          }
+        } else {
+          if (takenFlag) onCount += 1;
+          const onDays = Number(cfg.onDays || 0);
+          const offDays = Number(cfg.offDays || 0);
+          if (onDays > 0 && onCount >= onDays) {
+            if (offDays > 0) {
+              phase = "OFF";
+              offRem = offDays;
+            } else {
+              phase = "ON";
+              onCount = 0;
+            }
+          }
+        }
+      }
+
+      result.set(s.canon, mapISO);
+    }
+
+    return result;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [yearCursor, allSupp, cycles, notTaken, mealsByDate, routine2, routine3, userRoutine, selectedDate]);
+
+  function statusForCanonOnDate(canon, dateObj) {
+    const cfg = cfgForCanon(canon);
+    if (!cfg || cfg.mode === "none") return "ON";
+    if (cfg.mode === "calendar") return statusCalendar(canon, dateObj);
+    if (cfg.mode === "taken") {
+      const map = takenModeMapForYear.get(canon);
+      const iso = U.toISODate(dateObj);
+      return map?.get(iso) || "ON";
+    }
+    return "ON";
+  }
+
+  function phaseEndISO(canon, fromISO) {
+    const from = U.parseISODate(fromISO) || new Date();
+    const st0 = statusForCanonOnDate(canon, from);
+    for (let i = 1; i <= 420; i++) {
+      const d = U.addDays(from, i);
+      const st = statusForCanonOnDate(canon, d);
+      if (st !== st0) return U.toISODate(d);
+    }
+    return "—";
+  }
+
+  function phaseInfo(canon, fromISO) {
+    const cfg = cfgForCanon(canon);
+    const st = statusForCanonOnDate(canon, U.parseISODate(fromISO) || new Date());
+    const end = phaseEndISO(canon, fromISO);
+
+    let pauseDur = 0;
+    if (st === "ON") pauseDur = Number(cfg.offDays || 0);
+    else pauseDur = 0;
+
+    return { status: st, phaseEnd: end, pauseDur };
+  }
+
+  function isPlannedForDate(dateObj, item) {
+    // schedule rules
+    const wdSet = U.extractWeekdaysFromText(item.dosis, item.regla, item.notas);
+    if (wdSet && !wdSet.has(U.isoWeekday(dateObj))) return false;
+
+    const interval = U.extractIntervalDaysFromText(item.dosis, item.regla, item.notas);
+    if (interval && interval > 1) {
+      const cfg = cfgForCanon(item.canon);
+      const anchorISO = cfg.intervalAnchorISO || cfg.startISO || tomorrowISO;
+      const anchor = U.parseISODate(anchorISO);
+      if (anchor) {
+        const diff = Math.floor((dateObj.getTime() - anchor.getTime()) / U.MS_DAY);
+        if (diff < 0 || diff % interval !== 0) return false;
+      }
+    }
+
+    const st = statusForCanonOnDate(item.canon, dateObj);
+    if (st === "ON") return true;
+    return showOff;
   }
 
   function plannedItemsForISO(dateISO) {
-    const d = parseISODate(dateISO);
+    const d = U.parseISODate(dateISO);
     if (!d) return [];
+    const routine = routineForISO(dateISO);
+
     return routine
       .filter((ri) => isPlannedForDate(d, ri))
-      .map((ri) => {
-        const p = paramByCanon.get(ri.canon);
-        const st = p ? computeStatusForDate(d, p) : "ON";
-        return { ...ri, status: st };
-      })
+      .map((ri) => ({
+        ...ri,
+        status: statusForCanonOnDate(ri.canon, d),
+        phaseEnd: phaseEndISO(ri.canon, dateISO),
+      }))
       .sort((a, b) => (a._ord - b._ord) || a.suplemento.localeCompare(b.suplemento));
   }
 
-  function getTakenMap(dateISO) {
-    const base = taken && typeof taken === "object" ? taken : {};
-    return base[dateISO] || {};
-  }
-
-  function setTakenFor(dateISO, itemKey, value) {
-    setTaken((prev) => {
-      const p = (prev && typeof prev === "object") ? prev : {};
-      const day = { ...(p[dateISO] || {}) };
-      if (value) day[itemKey] = true;
-      else delete day[itemKey];
-      return { ...p, [dateISO]: day };
-    });
-  }
-
-  function markAll(dateISO) {
-    const items = plannedItemsForISO(dateISO).filter((x) => x.status === "ON");
-    setTaken((prev) => {
-      const p = (prev && typeof prev === "object") ? prev : {};
-      const day = { ...(p[dateISO] || {}) };
-      for (const it of items) day[it.key] = true;
-      return { ...p, [dateISO]: day };
-    });
-  }
-
-  function clearDay(dateISO) {
-    setTaken((prev) => {
-      const p = (prev && typeof prev === "object") ? prev : {};
-      return { ...p, [dateISO]: {} };
-    });
-  }
-
-  const dayObj = useMemo(() => parseISODate(selectedDate) || new Date(), [selectedDate]);
-  const todayISO = toISODate(new Date());
-
   function completionForDate(dateObj) {
-    const iso = toISODate(dateObj);
+    const iso = U.toISODate(dateObj);
     const planned = plannedItemsForISO(iso).filter((x) => x.status === "ON");
-    const tm = getTakenMap(iso);
+    const nt = getNotTakenMap(iso);
+
     const plannedCount = planned.length;
-    const takenCount = planned.filter((x) => tm[x.key]).length;
+    const notTakenCount = planned.filter((x) => nt[x.key]).length;
+    const takenCount = plannedCount - notTakenCount;
+
     return { plannedCount, takenCount, ratio: plannedCount ? takenCount / plannedCount : 0 };
   }
 
-  const weekDays = useMemo(() => {
-    const start = startOfWeekMonday(dayObj);
-    return Array.from({ length: 7 }, (_, i) => addDays(start, i));
-  }, [dayObj]);
-
-  const monthGrid = useMemo(() => {
-    const first = startOfMonth(monthCursor);
-    const last = endOfMonth(monthCursor);
-    const pad = ((first.getDay() + 6) % 7);
-    const cells = [];
-    for (let i = 0; i < pad; i++) cells.push(null);
-    for (let d = 1; d <= last.getDate(); d++) cells.push(new Date(first.getFullYear(), first.getMonth(), d));
-    while (cells.length % 7 !== 0) cells.push(null);
-    while (cells.length < 42) cells.push(null);
-    return cells.slice(0, 42);
-  }, [monthCursor]);
-
-  const plannedToday = useMemo(() => plannedItemsForISO(selectedDate), [selectedDate, routine, params, showOff]);
-  const takenToday = useMemo(() => getTakenMap(selectedDate), [taken, selectedDate]);
+  const plannedToday = useMemo(() => plannedItemsForISO(selectedDate), [selectedDate, routine2, routine3, userRoutine, cycles, showOff, mealsByDate, notTaken]);
+  const notTakenToday = useMemo(() => getNotTakenMap(selectedDate), [notTaken, selectedDate]);
 
   const groupedByMomento = useMemo(() => {
     const g = new Map();
@@ -398,9 +597,26 @@ function AppInner() {
     return Array.from(g.entries());
   }, [plannedToday]);
 
+  const weekDays = useMemo(() => {
+    const start = U.startOfWeekMonday(dayObj);
+    return Array.from({ length: 7 }, (_, i) => U.addDays(start, i));
+  }, [dayObj]);
+
+  const monthGrid = useMemo(() => {
+    const first = U.startOfMonth(monthCursor);
+    const last = U.endOfMonth(monthCursor);
+    const pad = ((first.getDay() + 6) % 7);
+    const cells = [];
+    for (let i = 0; i < pad; i++) cells.push(null);
+    for (let d = 1; d <= last.getDate(); d++) cells.push(new Date(first.getFullYear(), first.getMonth(), d));
+    while (cells.length % 7 !== 0) cells.push(null);
+    while (cells.length < 42) cells.push(null);
+    return cells.slice(0, 42);
+  }, [monthCursor]);
+
   async function handleUpload(file) {
-    setErrorMsg("");
     if (!file) return;
+    setErrorMsg("");
     setFileName(file.name);
 
     try {
@@ -409,234 +625,187 @@ function AppInner() {
       const wb = XLSX.read(buf, { type: "array", cellDates: true });
 
       const sheetNames = wb.SheetNames || [];
-      const findSheet = (cands) => {
-        const lower = sheetNames.map((s) => s.toLowerCase());
-        for (const c of cands) {
-          const idx = lower.indexOf(c.toLowerCase());
-          if (idx >= 0) return sheetNames[idx];
-        }
-        for (const c of cands) {
-          const idx = lower.findIndex((s) => s.includes(c.toLowerCase()));
-          if (idx >= 0) return sheetNames[idx];
-        }
-        return null;
-      };
+      const norm = (s) => String(s ?? "").toLowerCase().replace(/\s+/g, " ").trim();
 
-      const parametrosName = findSheet(["Parametros"]);
-      const rutinaName = findSheet(["Rutina_Diaria", "Rutina", "Plan", "Suplementos", "Input"]) || sheetNames[0];
+      const sheet2 = sheetNames.find((s) => norm(s) === "2 comidas");
+      const sheet3 = sheetNames.find((s) => norm(s) === "3 comidas");
 
-      const toJson = (name) => {
-        const ws = wb.Sheets[name];
-        return ws ? XLSX.utils.sheet_to_json(ws, { defval: "" }) : [];
-      };
+      if (!sheet2 && !sheet3) {
+        throw new Error(`No encuentro hojas "2 comidas" / "3 comidas". Hojas detectadas: ${sheetNames.join(", ")}`);
+      }
 
-      const parametrosRows = parametrosName ? toJson(parametrosName) : [];
-      const rutinaRows = rutinaName ? toJson(rutinaName) : [];
+      const r2 = sheet2 ? parseRoutineSheet(wb, sheet2, XLSX, "excel2") : [];
+      const r3 = sheet3 ? parseRoutineSheet(wb, sheet3, XLSX, "excel3") : [];
 
-      const normalizedParams = parametrosRows
-        .map((r) => {
-          const name = String(r["Suplemento"] || r["SUPLEMENTO"] || r["Supplement"] || "").trim();
-          if (!name) return null;
+      setRoutine2(r2);
+      setRoutine3(r3);
 
-          const onDays = Number(r["ON (días)"] || r["ON"] || r["ON (dias)"] || r["ON dias"]);
-          const offDays = Number(r["OFF (días)"] || r["OFF"] || r["OFF (dias)"] || r["OFF dias"]);
-          if (!Number.isFinite(onDays) || !Number.isFinite(offDays)) return null;
+      // initialize cycles defaults for any new supplements
+      for (const it of [...r2, ...r3]) ensureDefaultsForCanon(it.canon, it.suplemento);
 
-          const pauseDays = Number(r["Pausa inicial (días)"] || r["Pausa inicial"] || 0);
-
-          const startRaw = r["Inicio ciclo (fecha)"] || r["Inicio ciclo"] || r["Inicio"];
-          let startDate = null;
-          if (startRaw instanceof Date && !Number.isNaN(startRaw.getTime())) startDate = startRaw;
-          else {
-            const d = new Date(String(startRaw || "").trim());
-            if (!Number.isNaN(d.getTime())) startDate = d;
-          }
-
-          return {
-            canon: canonKey(name),
-            name,
-            startDate,
-            onDays: clamp(onDays, 1, 3650),
-            offDays: clamp(offDays, 0, 3650),
-            pauseDays: clamp(Number.isFinite(pauseDays) ? pauseDays : 0, 0, 3650),
-          };
-        })
-        .filter(Boolean);
-
-      const order = {
-        Ayunas: 1,
-        "A primera hora antes entreno": 1,
-        "POST ENTRENAMIENTO": 2,
-        "Post Entrenamiento": 2,
-        "ANTES DE DESAYUNO (30 MIN)": 3,
-        Desayuno: 4,
-        "ANTES DE COMER (30 MIN)": 5,
-        Comida: 6,
-        Cena: 7,
-        "Antes de dormir": 8,
-        Noche: 8,
-      };
-
-      const normalizedRoutine = rutinaRows
-        .map((row) => {
-          const momento = String(
-            row["Momento"] ||
-              row["Momento del Día"] ||
-              row["Momento del Dia"] ||
-              row["Momento del día"] ||
-              ""
-          ).trim();
-
-          const suplemento = String(row["Suplemento"] || row["Suplementos"] || row["Supplement"] || "").trim();
-          if (!suplemento) return null;
-
-          const dosis = String(row["Dosis"] || row["Dose"] || "").trim();
-          const regla = String(row["Regla"] || row["Rule"] || "").trim();
-          const notas = String(row["Notas"] || row["Notes"] || "").trim();
-
-          const momentoNorm = momento || "Sin momento";
-          return {
-            key: `${momentoNorm}||${suplemento}`,
-            canon: canonKey(suplemento),
-            momento: momentoNorm,
-            suplemento,
-            dosis,
-            regla,
-            notas,
-            _ord: order[momentoNorm] ?? 99,
-          };
-        })
-        .filter(Boolean);
-
-      setParams(normalizedParams);
-      setRoutine(normalizedRoutine);
-
-      setYearCursor(new Date().getFullYear());
-      setSelectedDate(todayISO);
-      setMonthCursor(startOfMonth(new Date()));
     } catch (e) {
-      setErrorMsg(String(e?.message || e));
+      console.error(e);
+      setErrorMsg(String(e?.stack || e?.message || e));
     }
   }
 
-  // ===== Pricing =====
-  function updatePriceField(canon, patch) {
-    setPrices((prev) => {
-      const p = (prev && typeof prev === "object") ? prev : {};
-      return {
-        ...p,
-        [canon]: { ...(p[canon] || {}), ...patch },
-      };
+  function updateCycle(canon, patch) {
+    setCycles((prev) => {
+      const base = prev && typeof prev === "object" ? { ...prev } : {};
+      base[canon] = { ...(base[canon] || { mode: "none", startISO: tomorrowISO, intervalAnchorISO: tomorrowISO }), ...patch };
+      if (!base[canon].intervalAnchorISO) base[canon].intervalAnchorISO = base[canon].startISO || tomorrowISO;
+      return base;
     });
   }
 
-  function plannedItemsForDayDateObj(dateObj) {
-    const iso = toISODate(dateObj);
-    return plannedItemsForISO(iso).filter((x) => x.status === "ON");
+  // ---------- Costs ----------
+  function unitPriceFor(canon) {
+    const p = prices?.[canon];
+    if (!p) return null;
+    const priceEUR = Number(p.priceEUR || 0);
+    const units = Number(p.units || 0);
+    if (!priceEUR || !units) return null;
+    return priceEUR / units;
   }
 
-  function computeYearUsage(year) {
-    const totals = new Map();
-    const start = new Date(year, 0, 1);
-    const end = new Date(year, 11, 31);
+  function yearlyConsumptionUnits(canon) {
+    // Sum over year: each planned ON day counts dose units.
+    const yearStart = new Date(yearCursor, 0, 1);
+    const yearEnd = new Date(yearCursor, 11, 31);
 
-    for (let d = new Date(start); d <= end; d = addDays(d, 1)) {
-      const items = plannedItemsForDayDateObj(d);
+    let totalUnits = 0;
+
+    for (let d = new Date(yearStart); d <= yearEnd; d = U.addDays(d, 1)) {
+      const iso = U.toISODate(d);
+      const items = routineForISO(iso).filter((x) => x.canon === canon);
+
       for (const it of items) {
-        const pref = prices[it.canon]?.unitType || "";
-        const parsed = parseDoseUnits(it.dosis, pref);
-        const current = totals.get(it.canon) || { name: it.suplemento, unit: parsed?.unit || pref || "caps", unitsYear: 0 };
-        if (parsed?.value) current.unitsYear += parsed.value;
-        totals.set(it.canon, current);
+        // only if planned and ON
+        if (!isPlannedForDate(d, { ...it, canon })) continue;
+        if (statusForCanonOnDate(canon, d) !== "ON") continue;
+
+        const { qty } = U.parseDoseUnits(it.dosis);
+        if (qty != null) totalUnits += qty;
+        else totalUnits += 0; // unknown
       }
     }
-
-    // override u/día (solo días ON)
-    const onDaysByCanon = new Map();
-    for (let d = new Date(year, 0, 1); d <= new Date(year, 11, 31); d = addDays(d, 1)) {
-      const items = plannedItemsForDayDateObj(d);
-      const seen = new Set(items.map((x) => x.canon));
-      for (const c of seen) onDaysByCanon.set(c, (onDaysByCanon.get(c) || 0) + 1);
-    }
-
-    for (const [canon, entry] of totals.entries()) {
-      const overrideRaw = prices[canon]?.dailyOverride;
-      const overrideVal = overrideRaw !== "" && overrideRaw !== undefined ? Number(String(overrideRaw).replace(",", ".")) : NaN;
-      if (Number.isFinite(overrideVal)) {
-        const onDays = onDaysByCanon.get(canon) || 0;
-        entry.unitsYear = overrideVal * onDays;
-      }
-    }
-
-    const daysInYear = (new Date(year, 11, 31) - new Date(year, 0, 1)) / 86400000 + 1;
-    return { totals, daysInYear };
+    return totalUnits;
   }
 
-  const yearCostModel = useMemo(() => {
-    if (!routine.length) return null;
-    const { totals, daysInYear } = computeYearUsage(yearCursor);
+  function costBreakdown(canon) {
+    const up = unitPriceFor(canon);
+    if (up == null) return { day: null, month: null, year: null, unitsYear: yearlyConsumptionUnits(canon) };
 
-    const rows = [];
-    let totalYear = 0;
+    const unitsYear = yearlyConsumptionUnits(canon);
+    const yearCost = unitsYear * up;
+    const dayCost = yearCost / 365;
+    const monthCost = yearCost / 12;
+    return { day: dayCost, month: monthCost, year: yearCost, unitsYear };
+  }
 
-    for (const s of allSupp) {
-      const t = totals.get(s.canon);
-      const p = prices[s.canon] || {};
+  // ---------- Add supplement ----------
+  const [newSupp, setNewSupp] = useState({
+    suplemento: "",
+    momento: "COMIDA",
+    dosis: "",
+    regla: "",
+    notas: "",
+    cycleMode: "none",
+    startISO: tomorrowISO,
+    onDays: 90,
+    offDays: 30,
+    pauseDays: 0,
+    suggestedLabel: "",
+  });
 
-      const priceEUR = Number(String(p.priceEUR || "").replace(",", "."));
-      const packSize = Number(String(p.packSize || "").replace(",", "."));
-      const unitType = p.unitType || (t?.unit || "caps");
-      const unitsYear = t?.unitsYear ?? 0;
-
-      let costYear = NaN;
-      if (Number.isFinite(priceEUR) && Number.isFinite(packSize) && packSize > 0) {
-        costYear = (unitsYear / packSize) * priceEUR;
-      }
-      if (Number.isFinite(costYear)) totalYear += costYear;
-
-      rows.push({
-        canon: s.canon,
-        name: s.name,
-        unitType,
-        unitsYear,
-        priceEUR,
-        packSize,
-        costYear,
-        costMonthAvg: Number.isFinite(costYear) ? costYear / 12 : NaN,
-        costDayAvg: Number.isFinite(costYear) ? costYear / daysInYear : NaN,
-        missing: !(Number.isFinite(priceEUR) && Number.isFinite(packSize) && packSize > 0),
-      });
+  function applySuggestedCycle() {
+    const t = suggestCycleByName(newSupp.suplemento);
+    if (!t) {
+      setNewSupp((p) => ({ ...p, suggestedLabel: "Sin plantilla. Configura manualmente si quieres." }));
+      return;
     }
+    setNewSupp((p) => ({
+      ...p,
+      cycleMode: t.mode,
+      onDays: t.onDays ?? p.onDays,
+      offDays: t.offDays ?? p.offDays,
+      pauseDays: t.pauseDays ?? p.pauseDays,
+      suggestedLabel: `Aplicada: ${t.label}`,
+    }));
+  }
 
-    rows.sort((a, b) => {
-      if (a.missing && !b.missing) return 1;
-      if (!a.missing && b.missing) return -1;
-      const av = Number.isFinite(a.costYear) ? a.costYear : -1;
-      const bv = Number.isFinite(b.costYear) ? b.costYear : -1;
-      return bv - av;
+  function addSupplement() {
+    const name = newSupp.suplemento.trim();
+    if (!name) return;
+
+    const canon = U.canonKey(name);
+    const momento = newSupp.momento.trim() || "Sin momento";
+
+    const key = `${momento}||${canon}||user||${Date.now()}`;
+
+    setUserRoutine((prev) => {
+      const base = prev && typeof prev === "object" ? prev : { items: [] };
+      const items = Array.isArray(base.items) ? [...base.items] : [];
+      items.push({
+        key,
+        suplemento: name,
+        momento,
+        dosis: newSupp.dosis || "",
+        regla: newSupp.regla || "",
+        notas: newSupp.notas || "",
+      });
+      return { ...base, items };
     });
 
-    return { rows, totalYear, daysInYear };
-  }, [yearCursor, routine, params, prices, allSupp]);
+    // apply cycle if selected
+    if (newSupp.cycleMode && newSupp.cycleMode !== "none") {
+      updateCycle(canon, {
+        name,
+        mode: newSupp.cycleMode,
+        startISO: newSupp.startISO || tomorrowISO,
+        onDays: Number(newSupp.onDays) || 90,
+        offDays: Number(newSupp.offDays) || 30,
+        pauseDays: Number(newSupp.pauseDays) || 0,
+        intervalAnchorISO: newSupp.startISO || tomorrowISO,
+      });
+    } else {
+      // ensure exists (none)
+      ensureDefaultsForCanon(canon, name);
+    }
+
+    setNewSupp((p) => ({ ...p, suplemento: "", dosis: "", regla: "", notas: "", suggestedLabel: "" }));
+    setView("day");
+  }
 
   const navItems = [
     { k: "day", label: "Día" },
     { k: "week", label: "Semana" },
     { k: "month", label: "Mes" },
+    { k: "cycles", label: "Ciclos" },
     { k: "costs", label: "Costes" },
+    { k: "add", label: "Añadir" },
   ];
+
+  const hasAnyRoutine = routine2.length || routine3.length || (userRoutine?.items || []).length;
 
   return (
     <div className="app">
       <header className="topbar">
-        <div className="topbar-left">
+        <div>
           <div className="app-title">Suplementos Planner</div>
-          <div className="app-subtitle">Checklist + calendario + ciclos + costes.</div>
+          <div className="app-subtitle">
+            Persistente · 2/3 comidas · Ciclos ON/OFF · Por defecto: <b>tomado</b> (marca solo lo <b>NO tomado</b>)
+          </div>
         </div>
 
         <div className="topbar-right">
           <label className="btn">
-            <input type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={(e) => handleUpload(e.target.files?.[0])} />
+            <input
+              type="file"
+              accept=".xlsx,.xls"
+              style={{ display: "none" }}
+              onChange={(e) => handleUpload(e.target.files?.[0])}
+            />
             Subir Excel
           </label>
           <div className="fileName" title={fileName}>{fileName || ""}</div>
@@ -665,27 +834,42 @@ function AppInner() {
         </div>
       ) : null}
 
-      {!routine.length ? (
+      {!hasAnyRoutine ? (
         <div className="card">
-          <div className="cardTitle">Sube tu Excel</div>
-          <div className="muted">Recomendado: hojas Parametros y Rutina_Diaria.</div>
+          <div className="cardTitle">Sube tu Excel o añade suplementos</div>
+          <div className="muted">La app busca hojas “2 comidas” y “3 comidas”.</div>
         </div>
       ) : null}
 
-      {view === "day" && routine.length ? (
+      {/* DAY */}
+      {view === "day" ? (
         <div className="card">
           <div className="row">
             <div>
               <div className="cardTitle">Checklist del día</div>
               <div className="muted">{selectedDate}</div>
             </div>
-            <input className="date" type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} />
+            <div className="row">
+              <input className="date" type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} />
+            </div>
+          </div>
+
+          <div className="row" style={{ marginTop: 8 }}>
+            <div className="muted">Tipo de día:</div>
+            <div className="seg">
+              <button className={mealsForISO(selectedDate) === 2 ? "segBtn segOn" : "segBtn"} onClick={() => setMealsForISO(selectedDate, 2)}>
+                2 comidas
+              </button>
+              <button className={mealsForISO(selectedDate) === 3 ? "segBtn segOn" : "segBtn"} onClick={() => setMealsForISO(selectedDate, 3)}>
+                3 comidas
+              </button>
+            </div>
           </div>
 
           {(() => {
             const c = completionForDate(dayObj);
             return (
-              <div className="row">
+              <div className="row" style={{ marginTop: 10 }}>
                 <div className="muted">
                   Completado: <b>{c.takenCount}</b> / <b>{c.plannedCount}</b>
                 </div>
@@ -696,9 +880,9 @@ function AppInner() {
             );
           })()}
 
-          <div className="row">
-            <button className="btnPrimary" onClick={() => markAll(selectedDate)}>Marcar todo (ON)</button>
-            <button className="btnGhost" onClick={() => clearDay(selectedDate)}>Limpiar</button>
+          <div className="row" style={{ marginTop: 10 }}>
+            <button className="btnPrimary" onClick={() => assumeAllTaken(selectedDate)}>Asumir todo tomado</button>
+            <button className="btnGhost" onClick={() => markAllNotTaken(selectedDate)}>Marcar todo NO tomado</button>
             <button className="btnGhost" onClick={() => setSelectedDate(todayISO)}>Ir a hoy</button>
           </div>
 
@@ -712,13 +896,17 @@ function AppInner() {
                 <div className="items">
                   {items.map((it) => {
                     const isOff = it.status !== "ON";
+                    const info = phaseInfo(it.canon, selectedDate);
+
                     return (
                       <label key={it.key} className={isOff ? "item itemOff" : "item"}>
+                        {/* Checkbox means NOT taken */}
                         <input
                           type="checkbox"
                           disabled={isOff}
-                          checked={!!takenToday[it.key]}
-                          onChange={(e) => setTakenFor(selectedDate, it.key, e.target.checked)}
+                          checked={!!notTakenToday[it.key]}
+                          onChange={(e) => setNotTakenFor(selectedDate, it.key, e.target.checked)}
+                          title="Marca si NO lo has tomado"
                         />
                         <div className="itemBody">
                           <div className="itemTop">
@@ -726,10 +914,15 @@ function AppInner() {
                             <div className="itemBadges">
                               {it.dosis ? <Pill>{it.dosis}</Pill> : null}
                               {isOff ? <Pill tone="off">OFF</Pill> : <Pill tone="on">ON</Pill>}
+                              <Pill tone="info">Fin fase: {info.phaseEnd}</Pill>
+                              {it.status === "ON" && Number(cfgForCanon(it.canon)?.offDays || 0) > 0 ? (
+                                <Pill tone="info">Pausa: {Number(cfgForCanon(it.canon)?.offDays || 0)}d</Pill>
+                              ) : null}
                             </div>
                           </div>
                           {it.regla ? <div className="muted">{it.regla}</div> : null}
                           {it.notas ? <div className="note">{it.notas}</div> : null}
+                          {!!notTakenToday[it.key] ? <div className="note" style={{ borderStyle: "solid", borderColor: "rgba(255,77,109,.35)" }}>Marcado como: <b>NO tomado</b></div> : null}
                         </div>
                       </label>
                     );
@@ -741,7 +934,8 @@ function AppInner() {
         </div>
       ) : null}
 
-      {view === "week" && routine.length ? (
+      {/* WEEK */}
+      {view === "week" ? (
         <div className="card">
           <div className="row">
             <div className="cardTitle">Vista semanal</div>
@@ -750,13 +944,16 @@ function AppInner() {
 
           <div className="cards">
             {weekDays.map((d) => {
-              const iso = toISODate(d);
+              const iso = U.toISODate(d);
               const c = completionForDate(d);
+              const meals = mealsForISO(iso);
               return (
                 <button key={iso} className="dayCard" onClick={() => { setSelectedDate(iso); setView("day"); }}>
                   <div className="dayCardTop">
-                    <div className="dayCardTitle">{d.toLocaleDateString(undefined, { weekday: "short", day: "2-digit", month: "short" })}</div>
-                    {iso === todayISO ? <Pill>HOY</Pill> : null}
+                    <div className="dayCardTitle">
+                      {d.toLocaleDateString(undefined, { weekday: "short", day: "2-digit", month: "short" })}
+                    </div>
+                    <Pill>{meals}C</Pill>
                   </div>
                   <div className="muted">{c.takenCount}/{c.plannedCount}</div>
                   <Progress ratio={c.ratio} />
@@ -767,7 +964,8 @@ function AppInner() {
         </div>
       ) : null}
 
-      {view === "month" && routine.length ? (
+      {/* MONTH */}
+      {view === "month" ? (
         <div className="card">
           <div className="row">
             <div className="cardTitle">Vista mensual</div>
@@ -785,13 +983,14 @@ function AppInner() {
           <div className="monthGrid">
             {monthGrid.map((d, idx) => {
               if (!d) return <div key={idx} className="monthCell empty" />;
-              const iso = toISODate(d);
+              const iso = U.toISODate(d);
               const c = completionForDate(d);
+              const meals = mealsForISO(iso);
               return (
                 <button key={iso} className="monthCell" onClick={() => { setSelectedDate(iso); setView("day"); }}>
                   <div className="monthCellTop">
                     <div className="dayNum">{d.getDate()}</div>
-                    {iso === todayISO ? <Pill>HOY</Pill> : null}
+                    <Pill>{meals}C</Pill>
                   </div>
                   <div className="muted small">{c.takenCount}/{c.plannedCount}</div>
                   <div className="muted small">{Math.round(c.ratio * 100)}%</div>
@@ -802,97 +1001,226 @@ function AppInner() {
         </div>
       ) : null}
 
-      {view === "costs" && routine.length ? (
+      {/* CYCLES */}
+      {view === "cycles" ? (
         <div className="card">
           <div className="row">
             <div>
-              <div className="cardTitle">Costes por suplemento</div>
-              <div className="muted">Introduce precio y tamaño envase. Se calcula coste anual/mensual/diario.</div>
+              <div className="cardTitle">Ciclos (editable)</div>
+              <div className="muted">
+                <b>calendar</b>: rotación fija por fecha · <b>taken</b>: el ON se alarga si marcas “NO tomado”
+              </div>
             </div>
             <div className="row">
-              <button className="btnGhost" onClick={() => setYearCursor((y) => y - 1)}>←</button>
-              <div className="yearBox">{yearCursor}</div>
-              <button className="btnGhost" onClick={() => setYearCursor((y) => y + 1)}>→</button>
+              <div className="muted">Año:</div>
+              <input className="inp" style={{ width: 110 }} value={yearCursor} onChange={(e) => setYearCursor(Number(e.target.value || new Date().getFullYear()))} />
             </div>
           </div>
 
-          {yearCostModel ? (
-            <>
-              <div className="totalsBar">
-                <div className="totalsItem">
-                  <div className="muted">Total anual</div>
-                  <div className="totalsValue">{money(yearCostModel.totalYear)}</div>
-                </div>
-                <div className="totalsItem">
-                  <div className="muted">Mensual (promedio)</div>
-                  <div className="totalsValue">{money(yearCostModel.totalYear / 12)}</div>
-                </div>
-                <div className="totalsItem">
-                  <div className="muted">Diario (promedio)</div>
-                  <div className="totalsValue">{money(yearCostModel.totalYear / yearCostModel.daysInYear)}</div>
-                </div>
-              </div>
+          <div className="tableWrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Suplemento</th>
+                  <th>Modo</th>
+                  <th>Inicio</th>
+                  <th className="num">ON</th>
+                  <th className="num">OFF</th>
+                  <th className="num">Pausa inicial</th>
+                  <th>Estado hoy</th>
+                  <th>Fin fase</th>
+                  <th>Duración próxima pausa</th>
+                  <th>Anchor “cada N días”</th>
+                </tr>
+              </thead>
+              <tbody>
+                {allSupp.map((s) => {
+                  const c = cfgForCanon(s.canon);
+                  const st = statusForCanonOnDate(s.canon, new Date());
+                  const end = phaseEndISO(s.canon, todayISO);
+                  const nextPauseDur = st === "ON" ? Number(c.offDays || 0) : 0;
 
-              <div className="tableWrap">
-                <table className="table">
-                  <thead>
-                    <tr>
-                      <th>Suplemento</th>
-                      <th className="num">Precio (€)</th>
-                      <th className="num">Tamaño envase</th>
-                      <th>Unidad</th>
-                      <th className="num">Override u/día</th>
-                      <th className="num">Unidades/año</th>
-                      <th className="num">€/día</th>
-                      <th className="num">€/mes</th>
-                      <th className="num">€/año</th>
+                  return (
+                    <tr key={s.canon}>
+                      <td className="nameCell">
+                        <div className="nameMain">{s.name}</div>
+                      </td>
+                      <td>
+                        <select className="sel" value={c.mode || "none"} onChange={(e) => updateCycle(s.canon, { name: s.name, mode: e.target.value })}>
+                          <option value="none">none</option>
+                          <option value="calendar">calendar</option>
+                          <option value="taken">taken</option>
+                        </select>
+                      </td>
+                      <td>
+                        <input className="date" type="date" value={c.startISO || tomorrowISO} onChange={(e) => updateCycle(s.canon, { name: s.name, startISO: e.target.value })} />
+                      </td>
+                      <td className="num">
+                        <input className="inp" inputMode="numeric" value={c.onDays ?? ""} onChange={(e) => updateCycle(s.canon, { onDays: Number(e.target.value || 0) })} />
+                      </td>
+                      <td className="num">
+                        <input className="inp" inputMode="numeric" value={c.offDays ?? ""} onChange={(e) => updateCycle(s.canon, { offDays: Number(e.target.value || 0) })} />
+                      </td>
+                      <td className="num">
+                        <input className="inp" inputMode="numeric" value={c.pauseDays ?? 0} onChange={(e) => updateCycle(s.canon, { pauseDays: Number(e.target.value || 0) })} />
+                      </td>
+                      <td>{st === "ON" ? <Pill tone="on">ON</Pill> : <Pill tone="off">OFF</Pill>}</td>
+                      <td className="muted">{end}</td>
+                      <td className="muted">{nextPauseDur ? `${nextPauseDur} días` : "—"}</td>
+                      <td>
+                        <input className="date" type="date" value={c.intervalAnchorISO || c.startISO || tomorrowISO} onChange={(e) => updateCycle(s.canon, { intervalAnchorISO: e.target.value })} />
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {yearCostModel.rows.map((r) => {
-                      const entry = prices[r.canon] || {};
-                      return (
-                        <tr key={r.canon} className={r.missing ? "rowMissing" : ""}>
-                          <td className="nameCell">
-                            <div className="nameMain">{r.name}</div>
-                            {r.missing ? <div className="muted small">Faltan datos</div> : null}
-                          </td>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : null}
 
-                          <td className="num">
-                            <input className="inp" inputMode="decimal" value={entry.priceEUR ?? ""} onChange={(e) => updatePriceField(r.canon, { priceEUR: e.target.value })} placeholder="€" />
-                          </td>
+      {/* COSTS */}
+      {view === "costs" ? (
+        <div className="card">
+          <div className="row">
+            <div>
+              <div className="cardTitle">Costes</div>
+              <div className="muted">Introduce precio y unidades por producto (cápsulas o gramos). La app estima coste día/mes/año.</div>
+            </div>
+            <div className="row">
+              <div className="muted">Año:</div>
+              <input className="inp" style={{ width: 110 }} value={yearCursor} onChange={(e) => setYearCursor(Number(e.target.value || new Date().getFullYear()))} />
+            </div>
+          </div>
 
-                          <td className="num">
-                            <input className="inp" inputMode="decimal" value={entry.packSize ?? ""} onChange={(e) => updatePriceField(r.canon, { packSize: e.target.value })} placeholder={entry.unitType === "g" ? "g" : "caps"} />
-                          </td>
+          <div className="tableWrap">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Suplemento</th>
+                  <th className="num">Precio €</th>
+                  <th className="num">Unidades</th>
+                  <th>Tipo</th>
+                  <th className="num">Unid/año</th>
+                  <th className="num">€/día</th>
+                  <th className="num">€/mes</th>
+                  <th className="num">€/año</th>
+                </tr>
+              </thead>
+              <tbody>
+                {allSupp.map((s) => {
+                  const p = prices?.[s.canon] || { priceEUR: "", units: "", unitType: "caps" };
+                  const b = costBreakdown(s.canon);
 
-                          <td>
-                            <select className="sel" value={entry.unitType || "caps"} onChange={(e) => updatePriceField(r.canon, { unitType: e.target.value })}>
-                              <option value="caps">caps</option>
-                              <option value="g">g</option>
-                            </select>
-                          </td>
+                  return (
+                    <tr key={s.canon}>
+                      <td><div className="nameMain">{s.name}</div></td>
+                      <td className="num">
+                        <input
+                          className="inp"
+                          inputMode="decimal"
+                          value={p.priceEUR ?? ""}
+                          onChange={(e) => setPrices((prev) => ({ ...(prev || {}), [s.canon]: { ...(prev?.[s.canon] || {}), priceEUR: e.target.value } }))}
+                        />
+                      </td>
+                      <td className="num">
+                        <input
+                          className="inp"
+                          inputMode="numeric"
+                          value={p.units ?? ""}
+                          onChange={(e) => setPrices((prev) => ({ ...(prev || {}), [s.canon]: { ...(prev?.[s.canon] || {}), units: e.target.value } }))}
+                        />
+                      </td>
+                      <td>
+                        <select
+                          className="sel"
+                          value={p.unitType || "caps"}
+                          onChange={(e) => setPrices((prev) => ({ ...(prev || {}), [s.canon]: { ...(prev?.[s.canon] || {}), unitType: e.target.value } }))}
+                        >
+                          <option value="caps">cápsulas</option>
+                          <option value="g">gramos</option>
+                        </select>
+                      </td>
+                      <td className="num">{Math.round((b.unitsYear || 0) * 10) / 10}</td>
+                      <td className="num">{b.day == null ? "—" : (Math.round(b.day * 100) / 100).toFixed(2)}</td>
+                      <td className="num">{b.month == null ? "—" : (Math.round(b.month * 100) / 100).toFixed(2)}</td>
+                      <td className="num">{b.year == null ? "—" : (Math.round(b.year * 100) / 100).toFixed(2)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
 
-                          <td className="num">
-                            <input className="inp" inputMode="decimal" value={entry.dailyOverride ?? ""} onChange={(e) => updatePriceField(r.canon, { dailyOverride: e.target.value })} placeholder="(opc.)" />
-                          </td>
+          <div className="muted" style={{ marginTop: 10 }}>
+            Nota: si una dosis no es interpretable (p.ej. texto sin número), “Unid/año” puede quedar infravalorado.
+          </div>
+        </div>
+      ) : null}
 
-                          <td className="num">{number(r.unitsYear, 2)} {entry.unitType || r.unitType}</td>
-                          <td className="num">{money(r.costDayAvg)}</td>
-                          <td className="num">{money(r.costMonthAvg)}</td>
-                          <td className="num">{money(r.costYear)}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+      {/* ADD */}
+      {view === "add" ? (
+        <div className="card">
+          <div className="cardTitle">Añadir suplemento</div>
+          <div className="muted">Añade sin tocar el Excel. Se guardará localmente.</div>
 
-              <div className="muted small">
-                OFF no consume. Rango “4-5 g” se promedia. Si no se interpreta bien, usa override.
-              </div>
-            </>
-          ) : null}
+          <div className="formGrid">
+            <div>
+              <div className="muted small">Suplemento</div>
+              <input className="inpWide" value={newSupp.suplemento} onChange={(e) => setNewSupp((p) => ({ ...p, suplemento: e.target.value }))} placeholder="Ej: UC-II" />
+            </div>
+            <div>
+              <div className="muted small">Momento</div>
+              <input className="inpWide" value={newSupp.momento} onChange={(e) => setNewSupp((p) => ({ ...p, momento: e.target.value }))} placeholder="Ej: COMIDA" />
+            </div>
+            <div>
+              <div className="muted small">Dosis</div>
+              <input className="inpWide" value={newSupp.dosis} onChange={(e) => setNewSupp((p) => ({ ...p, dosis: e.target.value }))} placeholder="Ej: 1 cápsula" />
+            </div>
+            <div>
+              <div className="muted small">Regla (opcional)</div>
+              <input className="inpWide" value={newSupp.regla} onChange={(e) => setNewSupp((p) => ({ ...p, regla: e.target.value }))} placeholder="Ej: Lun/Mie/Vie" />
+            </div>
+            <div>
+              <div className="muted small">Notas (opcional)</div>
+              <input className="inpWide" value={newSupp.notas} onChange={(e) => setNewSupp((p) => ({ ...p, notas: e.target.value }))} placeholder="Ej: con comida" />
+            </div>
+          </div>
+
+          <div className="divider" />
+
+          <div className="row">
+            <button className="btnGhost" onClick={applySuggestedCycle}>Sugerir ciclo</button>
+            <div className="muted">{newSupp.suggestedLabel}</div>
+          </div>
+
+          <div className="row" style={{ marginTop: 10 }}>
+            <div className="muted">Ciclo:</div>
+            <select className="sel" style={{ maxWidth: 220 }} value={newSupp.cycleMode} onChange={(e) => setNewSupp((p) => ({ ...p, cycleMode: e.target.value }))}>
+              <option value="none">none (siempre ON)</option>
+              <option value="calendar">calendar</option>
+              <option value="taken">taken</option>
+            </select>
+
+            <div className="muted">Inicio:</div>
+            <input className="date" type="date" value={newSupp.startISO} onChange={(e) => setNewSupp((p) => ({ ...p, startISO: e.target.value }))} />
+
+            <div className="muted">ON</div>
+            <input className="inp" style={{ width: 90 }} value={newSupp.onDays} onChange={(e) => setNewSupp((p) => ({ ...p, onDays: e.target.value }))} />
+
+            <div className="muted">OFF</div>
+            <input className="inp" style={{ width: 90 }} value={newSupp.offDays} onChange={(e) => setNewSupp((p) => ({ ...p, offDays: e.target.value }))} />
+          </div>
+
+          <div className="row" style={{ marginTop: 10 }}>
+            <div className="muted">Pausa inicial</div>
+            <input className="inp" style={{ width: 110 }} value={newSupp.pauseDays} onChange={(e) => setNewSupp((p) => ({ ...p, pauseDays: e.target.value }))} />
+          </div>
+
+          <div className="row" style={{ marginTop: 12 }}>
+            <button className="btnPrimary" onClick={addSupplement}>Guardar suplemento</button>
+            <button className="btnGhost" onClick={() => setView("day")}>Cancelar</button>
+          </div>
         </div>
       ) : null}
 
